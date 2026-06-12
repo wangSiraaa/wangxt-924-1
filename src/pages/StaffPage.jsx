@@ -5,7 +5,7 @@ import { getFromStorage, setToStorage, StorageKeys } from '../storage/storage.js
 import {
   generatePrepTasks, getPrepTasks,
   getInventory, getSafetyStock, getSalesForecast,
-  getAvailableMenuItems
+  getAvailableMenuItems, getInTransit, confirmInTransit
 } from '../storage/inventory.js'
 
 export default function StaffPage() {
@@ -17,6 +17,7 @@ export default function StaffPage() {
   const [prepTasks, setPrepTasks] = useState([])
   const [availableItems, setAvailableItems] = useState([])
   const [filterCategory, setFilterCategory] = useState('all')
+  const [inTransit, setInTransit] = useState({})
 
   useEffect(() => {
     setToStorage(StorageKeys.CURRENT_STORE, currentStore)
@@ -27,6 +28,16 @@ export default function StaffPage() {
     const tasks = generatePrepTasks(currentStore)
     setPrepTasks(tasks)
     setAvailableItems(getAvailableMenuItems(currentStore))
+    setInTransit(getInTransit(currentStore))
+  }
+
+  function handleConfirmReceipt(materialId) {
+    const result = confirmInTransit(currentStore, materialId)
+    if (result.success) {
+      refreshData()
+    } else {
+      alert('确认收货失败：' + result.reason)
+    }
   }
 
   const categories = ['all', ...new Set(getMaterials().map(m => m.category))]
@@ -37,6 +48,7 @@ export default function StaffPage() {
 
   const criticalCount = prepTasks.filter(t => t.currentStock <= 0).length
   const warningCount = prepTasks.filter(t => t.belowSafety && t.currentStock > 0).length
+  const inTransitCount = Object.values(inTransit).filter(v => v > 0).length
 
   return (
     <div className="app-container">
@@ -65,6 +77,10 @@ export default function StaffPage() {
           <div className="label">待补料任务</div>
           <div className="value">{prepTasks.length}</div>
         </div>
+        <div className="summary-card">
+          <div className="label">在途原料</div>
+          <div className={`value ${inTransitCount > 0 ? 'warning' : 'success'}`}>{inTransitCount}</div>
+        </div>
       </div>
 
       <div className="tab-nav">
@@ -73,6 +89,9 @@ export default function StaffPage() {
         </button>
         <button className={`tab-btn ${activeTab === 'menu' ? 'active' : ''}`} onClick={() => setActiveTab('menu')}>
           可售单品
+        </button>
+        <button className={`tab-btn ${activeTab === 'transit' ? 'active' : ''}`} onClick={() => setActiveTab('transit')}>
+          在途确认 {inTransitCount > 0 && <span className="status-tag danger" style={{ marginLeft: 6, fontSize: 10 }}>{inTransitCount}</span>}
         </button>
       </div>
 
@@ -196,6 +215,51 @@ export default function StaffPage() {
                 </div>
               )
             })
+          )}
+        </div>
+      )}
+
+      {activeTab === 'transit' && (
+        <div className="panel">
+          <h3>在途原料确认</h3>
+          <p style={{ fontSize: 13, color: '#64748b', marginBottom: 16 }}>
+            跨店调拨审批通过后，原料进入在途状态。确认收货后，库存自动增加。
+            在途未确认的原料将阻止日结提交。
+          </p>
+          {Object.entries(inTransit).filter(([, v]) => v > 0).length === 0 ? (
+            <div className="success-box">📦 暂无在途原料</div>
+          ) : (
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>原料</th>
+                  <th>在途数量</th>
+                  <th>当前库存</th>
+                  <th>确认后库存</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.entries(inTransit).filter(([, v]) => v > 0).map(([mid, qty]) => {
+                  const mat = getMaterialById(mid)
+                  const inv = getInventory(currentStore)
+                  const currentStock = inv[mid] || 0
+                  return (
+                    <tr key={mid} className="row-warning">
+                      <td>{mat?.name || mid}</td>
+                      <td className="cell-warning">{qty} {mat?.unit || ''}</td>
+                      <td>{currentStock} {mat?.unit || ''}</td>
+                      <td className="cell-ok">{currentStock + qty} {mat?.unit || ''}</td>
+                      <td>
+                        <button className="btn btn-primary btn-sm" onClick={() => handleConfirmReceipt(mid)}>
+                          确认收货
+                        </button>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
           )}
         </div>
       )}

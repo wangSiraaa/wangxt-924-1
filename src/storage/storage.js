@@ -12,6 +12,8 @@ export const StorageKeys = {
   CORRECTIONS: STORAGE_PREFIX + 'corrections_',
   DAILY_CLOSING: STORAGE_PREFIX + 'dailyClosing_',
   INVENTORY_CHECK: STORAGE_PREFIX + 'inventoryCheck_',
+  TRANSFERS: STORAGE_PREFIX + 'transfers_',
+  IN_TRANSIT: STORAGE_PREFIX + 'inTransit_',
   ROLE: STORAGE_PREFIX + 'role',
   CURRENT_STORE: STORAGE_PREFIX + 'currentStore'
 }
@@ -51,4 +53,6 @@ export function clearToday(storeId) {
   localStorage.removeItem(StorageKeys.CORRECTIONS + storeId + '_' + tk)
   localStorage.removeItem(StorageKeys.DAILY_CLOSING + storeId + '_' + tk)
   localStorage.removeItem(StorageKeys.INVENTORY_CHECK + storeId + '_' + tk)
+  localStorage.removeItem(StorageKeys.TRANSFERS + storeId + '_' + tk)
+  localStorage.removeItem(StorageKeys.IN_TRANSIT + storeId + '_' + tk)
 }

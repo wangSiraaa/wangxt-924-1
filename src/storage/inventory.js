@@ -1,5 +1,5 @@
 import { getFromStorage, setToStorage, StorageKeys, todayKey } from './storage.js'
-import { getMaterials, getMenuItems, getOnSaleMenuItems, getMaterialById, getMenuItemById } from './seedData.js'
+import { getMaterials, getMenuItems, getOnSaleMenuItems, getMaterialById, getMenuItemById, getStores } from './seedData.js'
 
 export function getInventory(storeId, date = todayKey()) {
   const key = StorageKeys.INVENTORY + storeId + '_' + date
@@ -139,9 +139,20 @@ export function validateDailyClosing(storeId, date = todayKey()) {
   }
 
   const losses = getLossReports(storeId, date)
-  const unhandled = losses.filter(l => l.status !== 'processed')
+  const unhandled = losses.filter(l => l.status !== 'processed' && l.status !== 'rejected')
   if (unhandled.length > 0) {
     errors.push({ type: 'unhandled_loss', message: `存在 ${unhandled.length} 条未处理的报损记录` })
+  }
+
+  const pendingApprovalLosses = losses.filter(l => l.status === 'pending_approval')
+  if (pendingApprovalLosses.length > 0) {
+    errors.push({ type: 'pending_approval_loss', message: `存在 ${pendingApprovalLosses.length} 条待审批报损记录` })
+  }
+
+  const inTransit = getInTransit(storeId, date)
+  const unconfirmedTransit = Object.entries(inTransit).filter(([, v]) => v > 0)
+  if (unconfirmedTransit.length > 0) {
+    errors.push({ type: 'unconfirmed_in_transit', message: `存在 ${unconfirmedTransit.length} 种原料在途未确认` })
   }
 
   return { valid: errors.length === 0, errors }
@@ -287,15 +298,19 @@ export function getStoreSummary(storeId, date = todayKey()) {
   const closed = isDailyClosed(storeId, date)
   const checkCompleted = isInventoryCheckCompleted(storeId, date)
   const losses = getLossReports(storeId, date)
+  const inTransit = getInTransit(storeId, date)
+  const transfers = getTransfers(storeId, date)
 
   const belowSafety = tasks.filter(t => t.belowSafety).length
   const negativeCount = Object.values(inventory).filter(v => v != null && v < 0).length
   const unhandledLosses = losses.filter(l => l.status !== 'processed').length
+  const inTransitCount = Object.values(inTransit).filter(v => v > 0).length
+  const pendingTransfers = transfers.filter(t => t.status === 'pending').length
 
   let riskLevel = 'low'
-  if (belowSafety > 3 || negativeCount > 0 || unhandledLosses > 0 || !checkCompleted) {
+  if (belowSafety > 3 || negativeCount > 0 || unhandledLosses > 0 || !checkCompleted || inTransitCount > 0) {
     riskLevel = 'high'
-  } else if (belowSafety > 0) {
+  } else if (belowSafety > 0 || pendingTransfers > 0) {
     riskLevel = 'medium'
   }
 
@@ -308,6 +323,293 @@ export function getStoreSummary(storeId, date = todayKey()) {
     inventoryCheckCompleted: checkCompleted,
     dailyClosed: closed,
     prepTaskCount: tasks.length,
-    outOfStockCount: tasks.filter(t => t.currentStock <= 0).length
+    outOfStockCount: tasks.filter(t => t.currentStock <= 0).length,
+    inTransitCount,
+    pendingTransfers
   }
+}
+
+export function getTransfers(storeId, date = todayKey()) {
+  const key = StorageKeys.TRANSFERS + storeId + '_' + date
+  return getFromStorage(key, [])
+}
+
+function saveTransfers(storeId, transfers, date = todayKey()) {
+  const key = StorageKeys.TRANSFERS + storeId + '_' + date
+  setToStorage(key, transfers)
+}
+
+export function getAllTransfersForRegion(region, date = todayKey()) {
+  const stores = getStores().filter(s => s.region === region)
+  const all = []
+  for (const s of stores) {
+    const t = getTransfers(s.id, date)
+    all.push(...t)
+  }
+  return all
+}
+
+export function getInTransit(storeId, date = todayKey()) {
+  const key = StorageKeys.IN_TRANSIT + storeId + '_' + date
+  return getFromStorage(key, {})
+}
+
+function saveInTransit(storeId, inTransit, date = todayKey()) {
+  const key = StorageKeys.IN_TRANSIT + storeId + '_' + date
+  setToStorage(key, inTransit)
+}
+
+export function createTransferRequest(fromStoreId, toStoreId, materialId, qty, date = todayKey()) {
+  if (isDailyClosed(fromStoreId, date) || isDailyClosed(toStoreId, date)) {
+    return { success: false, reason: 'closed' }
+  }
+
+  const stores = getStores()
+  const fromStore = stores.find(s => s.id === fromStoreId)
+  const toStore = stores.find(s => s.id === toStoreId)
+
+  if (!fromStore || !toStore) {
+    return { success: false, reason: 'store_not_found' }
+  }
+
+  if (fromStore.region !== toStore.region) {
+    return { success: false, reason: 'different_region' }
+  }
+
+  if (fromStoreId === toStoreId) {
+    return { success: false, reason: 'same_store' }
+  }
+
+  const inventory = getInventory(fromStoreId, date)
+  const currentStock = inventory[materialId]
+  if (currentStock == null || currentStock < qty) {
+    return { success: false, reason: 'insufficient_stock' }
+  }
+
+  const mat = getMaterialById(materialId)
+  const menuItems = getMenuItems()
+  const onlyInDiscontinued = menuItems.every(item => {
+    if (item.status === 'on_sale') return true
+    return !item.recipe.some(r => r.materialId === materialId)
+  })
+  const hasOnSaleUse = menuItems.some(item =>
+    item.status === 'on_sale' && item.recipe.some(r => r.materialId === materialId)
+  )
+
+  const transfer = {
+    id: 'T' + Date.now(),
+    fromStoreId,
+    toStoreId,
+    fromStoreName: fromStore.name,
+    toStoreName: toStore.name,
+    materialId,
+    materialName: mat?.name || materialId,
+    qty,
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+    isDiscontinuedOnly: !hasOnSaleUse
+  }
+
+  const fromTransfers = getTransfers(fromStoreId, date)
+  fromTransfers.push(transfer)
+  saveTransfers(fromStoreId, fromTransfers, date)
+
+  const toTransfers = getTransfers(toStoreId, date)
+  toTransfers.push(transfer)
+  saveTransfers(toStoreId, toTransfers, date)
+
+  return { success: true, transfer }
+}
+
+export function approveTransfer(transferId, supervisorNote, date = todayKey()) {
+  const stores = getStores()
+  let transfer = null
+  let fromStoreId = null
+  let toStoreId = null
+
+  for (const s of stores) {
+    const transfers = getTransfers(s.id, date)
+    const found = transfers.find(t => t.id === transferId)
+    if (found && found.status === 'pending') {
+      transfer = found
+      fromStoreId = found.fromStoreId
+      toStoreId = found.toStoreId
+      break
+    }
+  }
+
+  if (!transfer) {
+    return { success: false, reason: 'not_found' }
+  }
+
+  if (isDailyClosed(fromStoreId, date) || isDailyClosed(toStoreId, date)) {
+    return { success: false, reason: 'closed' }
+  }
+
+  const fromInv = getInventory(fromStoreId, date)
+  const currentStock = fromInv[transfer.materialId] || 0
+  if (currentStock < transfer.qty) {
+    return { success: false, reason: 'insufficient_stock' }
+  }
+
+  fromInv[transfer.materialId] = currentStock - transfer.qty
+  const invKey = StorageKeys.INVENTORY + fromStoreId + '_' + date
+  setToStorage(invKey, fromInv)
+
+  const toInTransit = getInTransit(toStoreId, date)
+  toInTransit[transfer.materialId] = (toInTransit[transfer.materialId] || 0) + transfer.qty
+  saveInTransit(toStoreId, toInTransit, date)
+
+  for (const s of stores) {
+    const transfers = getTransfers(s.id, date)
+    const idx = transfers.findIndex(t => t.id === transferId)
+    if (idx >= 0) {
+      transfers[idx] = {
+        ...transfers[idx],
+        status: 'approved',
+        approvedAt: new Date().toISOString(),
+        supervisorNote: supervisorNote || ''
+      }
+      saveTransfers(s.id, transfers, date)
+    }
+  }
+
+  return { success: true }
+}
+
+export function rejectTransfer(transferId, supervisorNote, date = todayKey()) {
+  const stores = getStores()
+
+  for (const s of stores) {
+    const transfers = getTransfers(s.id, date)
+    const idx = transfers.findIndex(t => t.id === transferId)
+    if (idx >= 0) {
+      transfers[idx] = {
+        ...transfers[idx],
+        status: 'rejected',
+        rejectedAt: new Date().toISOString(),
+        supervisorNote: supervisorNote || ''
+      }
+      saveTransfers(s.id, transfers, date)
+    }
+  }
+
+  return { success: true }
+}
+
+export function confirmInTransit(storeId, materialId, date = todayKey()) {
+  if (isDailyClosed(storeId, date)) {
+    return { success: false, reason: 'closed' }
+  }
+
+  const inTransit = getInTransit(storeId, date)
+  const qty = inTransit[materialId] || 0
+
+  if (qty <= 0) {
+    return { success: false, reason: 'no_in_transit' }
+  }
+
+  const inv = getInventory(storeId, date)
+  inv[materialId] = (inv[materialId] || 0) + qty
+  const invKey = StorageKeys.INVENTORY + storeId + '_' + date
+  setToStorage(invKey, inv)
+
+  inTransit[materialId] = 0
+  saveInTransit(storeId, inTransit, date)
+
+  return { success: true, receivedQty: qty }
+}
+
+export function submitLossForApproval(storeId, lossId, date = todayKey()) {
+  if (isDailyClosed(storeId, date)) {
+    return { success: false, reason: 'closed' }
+  }
+
+  const losses = getLossReports(storeId, date)
+  const idx = losses.findIndex(l => l.id === lossId)
+  if (idx < 0) {
+    return { success: false, reason: 'not_found' }
+  }
+
+  if (losses[idx].status !== 'pending') {
+    return { success: false, reason: 'not_pending' }
+  }
+
+  losses[idx] = { ...losses[idx], status: 'pending_approval', submittedForApprovalAt: new Date().toISOString() }
+  saveLossReports(storeId, losses, date)
+
+  return { success: true }
+}
+
+export function approveLoss(storeId, lossId, date = todayKey()) {
+  const losses = getLossReports(storeId, date)
+  const idx = losses.findIndex(l => l.id === lossId)
+  if (idx < 0) {
+    return { success: false, reason: 'not_found' }
+  }
+
+  if (losses[idx].status !== 'pending_approval') {
+    return { success: false, reason: 'not_pending_approval' }
+  }
+
+  losses[idx] = { ...losses[idx], status: 'processed', processedAt: new Date().toISOString(), approvedBySupervisor: true }
+  saveLossReports(storeId, losses, date)
+
+  return { success: true }
+}
+
+export function rejectLoss(storeId, lossId, date = todayKey()) {
+  const losses = getLossReports(storeId, date)
+  const idx = losses.findIndex(l => l.id === lossId)
+  if (idx < 0) {
+    return { success: false, reason: 'not_found' }
+  }
+
+  if (losses[idx].status !== 'pending_approval') {
+    return { success: false, reason: 'not_pending_approval' }
+  }
+
+  losses[idx] = { ...losses[idx], status: 'rejected', rejectedAt: new Date().toISOString() }
+  saveLossReports(storeId, losses, date)
+
+  return { success: true }
+}
+
+export function addCorrectionForTransfer(storeId, transferId, reason, date = todayKey()) {
+  const transfers = getTransfers(storeId, date)
+  const transfer = transfers.find(t => t.id === transferId)
+  if (!transfer) {
+    return { success: false, reason: 'not_found' }
+  }
+
+  return addCorrection(storeId, {
+    materialId: transfer.materialId,
+    materialName: transfer.materialName,
+    newQty: (getInventory(storeId, date)[transfer.materialId] || 0),
+    reason: `调拨更正：${reason}`,
+    relatedTransferId: transferId
+  }, date)
+}
+
+export function addCorrectionForLoss(storeId, lossId, newQty, reason, date = todayKey()) {
+  const losses = getLossReports(storeId, date)
+  const loss = losses.find(l => l.id === lossId)
+  if (!loss) {
+    return { success: false, reason: 'not_found' }
+  }
+
+  return addCorrection(storeId, {
+    materialId: loss.materialId,
+    materialName: loss.materialName,
+    newQty,
+    reason: `报损更正：${reason}`,
+    relatedLossId: lossId
+  }, date)
+}
+
+export function getSameRegionStores(storeId) {
+  const stores = getStores()
+  const current = stores.find(s => s.id === storeId)
+  if (!current) return []
+  return stores.filter(s => s.region === current.region && s.id !== storeId)
 }
